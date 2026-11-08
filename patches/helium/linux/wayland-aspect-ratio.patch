@@ -1,0 +1,141 @@
+--- a/ui/ozone/platform/wayland/host/wayland_toplevel_window.cc
++++ b/ui/ozone/platform/wayland/host/wayland_toplevel_window.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "ui/ozone/platform/wayland/host/wayland_toplevel_window.h"
+ 
++#include <cmath>
++#include <limits>
+ #include <string>
+ 
+ #include "base/logging.h"
+@@ -20,6 +22,7 @@
+ #include "ui/events/base_event_utils.h"
+ #include "ui/gfx/geometry/insets.h"
+ #include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/geometry/size_f.h"
+ #include "ui/ozone/platform/wayland/host/dump_util.h"
+ #include "ui/ozone/platform/wayland/host/org_kde_kwin_appmenu.h"
+ #include "ui/ozone/platform/wayland/host/wayland_bubble.h"
+@@ -141,6 +144,14 @@
+                                                              EventTimeForNow());
+ }
+ 
++void WaylandToplevelWindow::SetAspectRatio(const gfx::SizeF& aspect_ratio) {
++  const float ratio = aspect_ratio.width() / aspect_ratio.height();
++  aspect_ratio_ = !aspect_ratio.IsEmpty() && std::isfinite(ratio) && ratio > 0
++                      ? std::make_optional(ratio)
++                      : std::nullopt;
++  aspect_ratio_resize_edge_.reset();
++}
++
+ void WaylandToplevelWindow::Show(bool inactive) {
+   if (xdg_toplevel_) {
+     return;
+@@ -163,6 +174,7 @@
+ }
+ 
+ void WaylandToplevelWindow::Hide() {
++  aspect_ratio_resize_edge_.reset();
+   if (!xdg_toplevel_) {
+     return;
+   }
+@@ -621,6 +633,37 @@
+   }
+ 
+   bounds_dip = AdjustBoundsToConstraintsDIP(bounds_dip);
++  // Wayland has no aspect-ratio hint. Constrain the client geometry while
++  // leaving fullscreen, maximized and tiled sizes under compositor control.
++  if (aspect_ratio_ && window_state == PlatformWindowState::kNormal &&
++      window_states.tiled_edges == WindowTiledEdges{}) {
++    const auto current_bounds = GetBoundsInDIP();
++    const auto edge = aspect_ratio_resize_edge_.value_or(
++        bounds_dip.width() == current_bounds.width() ? gfx::ResizeEdge::kBottom
++                                                     : gfx::ResizeEdge::kRight);
++    // Keep the controlling dimension for the whole drag. The compositor may
++    // continue proposing the initial width during a vertical resize.
++    if (window_states.is_resizing &&
++        bounds_dip.size() != current_bounds.size()) {
++      aspect_ratio_resize_edge_ = edge;
++    }
++    const auto min_size =
++        delegate()->GetMinimumSizeForWindow().value_or(gfx::Size());
++    auto max_size = delegate()->GetMaximumSizeForWindow();
++    if (max_size) {
++      if (max_size->width() == 0) {
++        max_size->set_width(std::numeric_limits<int>::max());
++      }
++      if (max_size->height() == 0) {
++        max_size->set_height(std::numeric_limits<int>::max());
++      }
++    }
++    gfx::SizeRectToAspectRatio(edge, *aspect_ratio_, min_size, max_size,
++                               &bounds_dip);
++  }
++  if (!window_states.is_resizing) {
++    aspect_ratio_resize_edge_.reset();
++  }
+   pending_configure_state_.bounds_dip = bounds_dip;
+   pending_configure_state_.size_px =
+       delegate()->ConvertRectToPixels(bounds_dip).size();
+--- a/ui/ozone/platform/wayland/host/wayland_toplevel_window.h
++++ b/ui/ozone/platform/wayland/host/wayland_toplevel_window.h
+@@ -14,6 +14,7 @@
+ #include "base/scoped_observation.h"
+ #include "ui/base/dragdrop/mojom/drag_drop_types.mojom-shared.h"
+ #include "ui/display/types/native_display_delegate.h"
++#include "ui/gfx/geometry/resize_utils.h"
+ #include "ui/gfx/geometry/vector2d.h"
+ #include "ui/ozone/platform/wayland/host/wayland_window.h"
+ #include "ui/ozone/platform/wayland/host/xdg_session.h"
+@@ -95,6 +96,7 @@
+   void Hide() override;
+   bool IsVisible() const override;
+   void SetTitle(const std::u16string& title) override;
++  void SetAspectRatio(const gfx::SizeF& aspect_ratio) override;
+   void SetFullscreen(bool fullscreen, int64_t target_display_id) override;
+   void Maximize() override;
+   void Minimize() override;
+@@ -230,6 +232,9 @@
+   PlatformWindowState last_configured_window_state_ =
+       PlatformWindowState::kUnknown;
+ 
++  std::optional<float> aspect_ratio_;
++  std::optional<gfx::ResizeEdge> aspect_ratio_resize_edge_;
++
+   bool pending_minimize_ = false;
+ 
+   bool is_active_ = false;
+--- a/ui/ozone/platform/wayland/host/xdg_toplevel.cc
++++ b/ui/ozone/platform/wayland/host/xdg_toplevel.cc
+@@ -246,6 +246,8 @@
+       CheckIfWlArrayHasValue(states, XDG_TOPLEVEL_STATE_FULLSCREEN);
+   window_states.is_activated =
+       CheckIfWlArrayHasValue(states, XDG_TOPLEVEL_STATE_ACTIVATED);
++  window_states.is_resizing =
++      CheckIfWlArrayHasValue(states, XDG_TOPLEVEL_STATE_RESIZING);
+ 
+   if (xdg_toplevel_get_version(toplevel) >=
+       XDG_TOPLEVEL_STATE_SUSPENDED_SINCE_VERSION) {
+--- a/ui/ozone/platform/wayland/host/wayland_window.cc
++++ b/ui/ozone/platform/wayland/host/wayland_window.cc
+@@ -823,6 +823,9 @@
+   if (is_activated) {
+     states += "activated ";
+   }
++  if (is_resizing) {
++    states += "resizing ";
++  }
+   if (is_suspended) {
+     states += "suspended ";
+   }
+--- a/ui/ozone/platform/wayland/host/wayland_window.h
++++ b/ui/ozone/platform/wayland/host/wayland_window.h
+@@ -271,6 +271,7 @@
+     bool is_maximized = false;
+     bool is_fullscreen = false;
+     bool is_activated = false;
++    bool is_resizing = false;
+     bool is_minimized = false;
+     bool is_suspended = false;
+     WindowTiledEdges tiled_edges;
